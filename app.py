@@ -95,7 +95,9 @@ def generate_dashboard():
         orders_agg = pd.merge(orders_agg, pick_agg, left_on=['delivery_date', 'sa_name'], right_on=['DeliveryDAte', 'Serviceability_Area'], how='left')
 
     # 7. FINAL FORMATTING
-    orders_agg.fillna(0, inplace=True)
+    # New way - only fills numeric columns with 0
+    numeric_cols = orders_agg.select_dtypes(include=['number']).columns
+    orders_agg[numeric_cols] = orders_agg[numeric_cols].fillna(0)
     
     # Rename for the final "Day wise Format"
     final_rename = {
