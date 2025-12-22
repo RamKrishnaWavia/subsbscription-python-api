@@ -1,126 +1,108 @@
+import streamlit as st
 import pandas as pd
-import glob
 import os
+import glob
 
-# --- CONFIGURATION ---
-# Path where your daily raw files are stored (use "." for the current folder)
-DATA_FOLDER = "." 
-OUTPUT_FILE = "final_daily_summary_dashboard.csv"
+# --- PAGE SETUP ---
+st.set_page_config(page_title="BBD Dashboard", layout="wide")
+st.title("🚀 BBD Daily Summary Dashboard")
 
 def load_file(keyword):
-    """Finds a file by keyword and loads it regardless of format (.csv, .xlsx, .xls)"""
-    # Look for any file containing the keyword with supported extensions
-    extensions = ['*.csv', '*.xlsx', '*.xls']
-    found_files = []
-    for ext in extensions:
-        found_files.extend(glob.glob(os.path.join(DATA_FOLDER, f"*{keyword}*{ext}")))
+    """Search for files matching the keyword (case-insensitive)"""
+    all_files = os.listdir('.')
+    matches = [f for f in all_files if keyword.lower() in f.lower() and f.endswith(('.csv', '.xlsx'))]
     
-    if not found_files:
-        print(f"Warning: No file found for keyword '{keyword}'")
+    if not matches:
         return None
     
-    # Pick the most recently modified file if multiple exist
-    target_file = max(found_files, key=os.path.getmtime)
-    print(f"Loading: {os.path.basename(target_file)}")
-    
-    if target_file.endswith('.csv'):
-        return pd.read_csv(target_file)
-    else:
-        return pd.read_excel(target_file)
+    target = matches[0] # Pick the first match
+    try:
+        if target.endswith('.csv'):
+            return pd.read_csv(target)
+        else:
+            return pd.read_excel(target, engine='openpyxl')
+    except Exception as e:
+        st.error(f"Error loading {target}: {e}")
+        return None
 
-def generate_dashboard():
-    print("--- Starting Dashboard Generation ---")
+# --- MAIN PROCESSING LOGIC ---
+if st.button("Generate Dashboard"):
+    with st.spinner("Processing files..."):
+        # 1. Load Datasets with correct keywords
+        df_ord = load_file("order_Report_SA_ID")
+        df_sales = load_file("order_sku_sales_bb2")
+        df_lmd = load_file("iot-rate-card-iot_orderwise")
+        df_ota = load_file("OTA")
+        df_pick = load_file("B2B_ORDER_pICK")
 
-    # 1. LOAD DATASETS
-    df_ord = load_file("order_Report_SA_ID")
-    df_sales = load_file("order_sku_sales")
-    df_lmd = load_file("iot_orderwise_rep")
-    df_ota = load_file("OTA")
-    df_pick = load_file("B2B_ORDER_pICK")
-    df_soc = load_file("Migrated Societies Data")
+        if df_ord is None:
+            st.error("❌ Critical Error: 'order_Report_SA_ID' file not found.")
+        else:
+            # --- STEP 1: Process Orders ---
+            df_ord['delivery_date'] = pd.to_datetime(df_ord['delivery_date'], errors='coerce').dt.normalize()
+            
+            orders_agg = df_ord.groupby(['delivery_date', 'sa_name']).agg(
+                unique_customers=('member_id', 'nunique'),
+                total_orders=('order_id', 'nunique'),
+                orders_delivered=('order_status', lambda x: x[x.isin(['complete', 'delivered'])].count()),
+                sub_orders=('Type', lambda x: (x == 'Subscription').sum()),
+                topup_orders=('Type', lambda x: (x == 'Topup').sum()),
+                oos_cancellations=('cancellation_reason', lambda x: x.str.contains('OOS|stock', case=False, na=False).sum()),
+                cx_cancellations=('cancellation_reason', lambda x: x.str.contains('customer', case=False, na=False).sum())
+            ).reset_index()
 
-    if df_ord is None:
-        print("Critical Error: Primary Order Report not found.")
-        return
+            # --- STEP 2: Merge Sales ---
+            if df_sales is not None:
+                df_sales['delivery_date'] = pd.to_datetime(df_sales['delivery_date'], errors='coerce').dt.normalize()
+                sales_agg = df_sales.groupby(['delivery_date', 'sa_name'])['total_sales'].sum().reset_index()
+                orders_agg = pd.merge(orders_agg, sales_agg, on=['delivery_date', 'sa_name'], how='left')
 
-    # 2. PROCESS ORDERS (Primary Metrics)
-    df_ord['delivery_date'] = pd.to_datetime(df_ord['delivery_date']).dt.normalize()
-    orders_agg = df_ord.groupby(['delivery_date', 'sa_name']).agg(
-        unique_customers=('member_id', 'nunique'),
-        total_orders=('order_id', 'nunique'),
-        orders_delivered=('order_status', lambda x: x[x.isin(['complete', 'delivered'])].count()),
-        sub_orders=('Type', lambda x: (x == 'Subscription').sum()),
-        topup_orders=('Type', lambda x: (x == 'Topup').sum()),
-        oos_cancellations=('cancellation_reason', lambda x: x.str.contains('OOS|Out of stock', case=False, na=False).sum()),
-        cx_cancellations=('cancellation_reason', lambda x: x.str.contains('customer', case=False, na=False).sum())
-    ).reset_index()
+            # --- STEP 3: Merge LMD Data (OTD & Routes) ---
+            if df_lmd is not None:
+                df_lmd['dt'] = pd.to_datetime(df_lmd['order_delivered_time'], errors='coerce').dt.normalize()
+                # OTD Logic: delivered before 7 AM
+                df_lmd['is_otd'] = pd.to_datetime(df_lmd['order_delivered_time']).dt.time < pd.to_datetime('07:00:00').time()
+                lmd_agg = df_lmd.groupby(['dt', 'sa_name']).agg(
+                    otd_perc=('is_otd', 'mean'),
+                    total_routes=('route_id', 'nunique')
+                ).reset_index()
+                orders_agg = pd.merge(orders_agg, lmd_agg, left_on=['delivery_date', 'sa_name'], right_on=['dt', 'sa_name'], how='left')
 
-    # 3. PROCESS SALES
-    if df_sales is not None:
-        df_sales['delivery_date'] = pd.to_datetime(df_sales['delivery_date']).dt.normalize()
-        sales_agg = df_sales.groupby(['delivery_date', 'sa_name']).agg(
-            total_qty=('quantity', 'sum'),
-            revenue=('total_sales', 'sum'),
-            milk_qty=('Milk / NM', lambda x: df_sales.loc[x.index, 'quantity'][x == 'Milk'].sum())
-        ).reset_index()
-        orders_agg = pd.merge(orders_agg, sales_agg, on=['delivery_date', 'sa_name'], how='left')
+            # --- STEP 4: FINAL CLEANUP (The fillna Fix) ---
+            # Explicitly fill only numeric columns to avoid FutureWarnings
+            numeric_cols = orders_agg.select_dtypes(include=['number']).columns
+            orders_agg[numeric_cols] = orders_agg[numeric_cols].fillna(0)
 
-    # 4. PROCESS LMD (OTD Metrics)
-    if df_lmd is not None:
-        df_lmd['dt'] = pd.to_datetime(df_lmd['order_delivered_time'], errors='coerce').dt.normalize()
-        df_lmd['is_otd'] = (pd.to_datetime(df_lmd['order_delivered_time']).dt.time < pd.to_datetime('07:00:00').time())
-        lmd_agg = df_lmd.groupby(['dt', 'sa_name']).agg(
-            otd_perc=('is_otd', 'mean'),
-            total_routes=('route_id', 'nunique')
-        ).reset_index()
-        orders_agg = pd.merge(orders_agg, lmd_agg, left_on=['delivery_date', 'sa_name'], right_on=['dt', 'sa_name'], how='left')
+            # Rename for final "Day wise Format"
+            final_rename = {
+                'delivery_date': 'Date', 
+                'sa_name': 'Store Name',
+                'unique_customers': 'Total Ordered Customers (Unique)',
+                'total_orders': 'Total Orders', 
+                'orders_delivered': 'Orders Delivered',
+                'sub_orders': 'Subscription Orders', 
+                'topup_orders': 'Top-up Orders',
+                'total_sales': 'Sale(₹)',
+                'otd_perc': 'On-Time Delivery (Before 7:00 AM)',
+                'total_routes': 'Total Routes'
+            }
+            orders_agg.rename(columns=final_rename, inplace=True)
 
-    # 5. PROCESS OTA (Truck Arrival)
-    if df_ota is not None:
-        # Handling multiple 'Store Name' columns in OTA report
-        ota_store_col = 'Viapoint Name' if 'Viapoint Name' in df_ota.columns else 'Store Name'
-        df_ota['Date'] = pd.to_datetime(df_ota['Date']).dt.normalize()
-        df_ota['is_ota'] = pd.to_datetime(df_ota['Arrival Time'], format='%H:%M:%S', errors='coerce').dt.time <= pd.to_datetime('03:00:00').time()
-        ota_agg = df_ota.groupby(['Date', ota_store_col])['is_ota'].any().reset_index()
-        orders_agg = pd.merge(orders_agg, ota_agg, left_on=['delivery_date', 'sa_name'], right_on=['Date', ota_store_col], how='left')
+            # --- STEP 5: DISPLAY & DOWNLOAD ---
+            st.success("✅ Dashboard Generated Successfully!")
+            
+            # Show the table in the browser
+            st.subheader("Data Preview")
+            st.dataframe(orders_agg, use_container_width=True)
 
-    # 6. PROCESS PICKING
-    if df_pick is not None:
-        df_pick['DeliveryDAte'] = pd.to_datetime(df_pick['DeliveryDAte'], dayfirst=True, errors='coerce').dt.normalize()
-        df_pick['on_time_pick'] = pd.to_datetime(df_pick['OPST_binned_time']).dt.time <= pd.to_datetime('04:00:00').time()
-        pick_agg = df_pick.groupby(['DeliveryDAte', 'Serviceability_Area']).agg(
-            picking_on_time=('on_time_pick', 'sum'),
-            rod_qty=('order_status', lambda x: df_pick.loc[x.index, 'picked_quantity'][x == 'return-on-delivery'].sum())
-        ).reset_index()
-        orders_agg = pd.merge(orders_agg, pick_agg, left_on=['delivery_date', 'sa_name'], right_on=['DeliveryDAte', 'Serviceability_Area'], how='left')
+            # Provide the download button
+            csv = orders_agg.to_csv(index=False).encode('utf-8')
+            st.download_button(
+                label="📥 Download Final Dashboard CSV",
+                data=csv,
+                file_name="final_daily_summary_dashboard.csv",
+                mime="text/csv"
+            )
 
-    # 7. FINAL FORMATTING
-    # New way - only fills numeric columns with 0
-    numeric_cols = orders_agg.select_dtypes(include=['number']).columns
-    orders_agg[numeric_cols] = orders_agg[numeric_cols].fillna(0)
-    
-    # Rename for the final "Day wise Format"
-    final_rename = {
-        'delivery_date': 'Date', 'sa_name': 'Store Name',
-        'unique_customers': 'Total Ordered Customers (Unique)',
-        'total_orders': 'Total Orders', 'orders_delivered': 'Orders Delivered',
-        'sub_orders': 'Subscription Orders', 'topup_orders': 'Top-up Orders',
-        'oos_cancellations': 'Undelivered Orders Due to OOS',
-        'cx_cancellations': 'Cancelled Orders by Customer',
-        'otd_perc': 'On-Time Delivery (Before 7:00 AM)',
-        'revenue': 'Sale(₹)', 'total_routes': 'Total Routes',
-        'is_ota': 'On Time Arrival (03:00 AM)',
-        'picking_on_time': 'On Time Picking (Before 4 AM)',
-        'rod_qty': 'ROD Quantity'
-    }
-    orders_agg.rename(columns=final_rename, inplace=True)
-
-    # Filter to requested columns
-    cols = [v for k, v in final_rename.items() if v in orders_agg.columns]
-    final_df = orders_agg[cols]
-    
-    final_df.to_csv(OUTPUT_FILE, index=False)
-    print(f"--- Success! Dashboard saved as: {OUTPUT_FILE} ---")
-
-if __name__ == "__main__":
-    generate_dashboard()
+# Sidebar info
+st.sidebar.info("Upload your CSV files to the GitHub folder and click 'Generate' to refresh data.")
