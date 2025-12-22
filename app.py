@@ -4,7 +4,7 @@ import numpy as np
 def generate_dashboard_data():
     # 1. LOAD DATA (Assuming CSV format from the provided files)
     orders = pd.read_csv("order_Report_SA_ID_BB2.0.csv")
-    sku_sales = pd.read_csv("order_sku_sales_bb2_report.csv")
+    sku_sales = pd.read_csv("order_sku_sales_bb2_report.xlsx")
     iot = pd.read_csv("iot-rate-card-iot_orderwise_rep.csv")
     ota = pd.read_csv("OTA.csv")
     b2b_pick = pd.read_csv("B2B_ORDER_pICK.csv")
